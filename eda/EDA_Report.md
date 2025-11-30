@@ -479,15 +479,33 @@ tau_gate = sigmoid(W_gate @ context_vector + b_gate)  # [0, 1]
 
 ### 9.5 Multi-Scale Temporal Processing
 
-**Three-Tau Layer Architecture:**
+**Three-Tau Layer Architecture (Data-Driven Design):**
 
-| Tau Layer | Base τ | Target Phenomenon | Temporal Scale |
-|-----------|--------|-------------------|----------------|
-| **Small τ** | 10 ns | First path signal | Fast reaction (~0.1 ns) |
-| **Medium τ** | 50 ns | First bounce | Medium reaction (~0.5 ns) |
-| **Large τ** | 200 ns | Multipath tail | Slow reaction (~2 ns) |
+**Hardware Constraints:**
+- Sample Period: TS_DW1000 = 15.65 ps
+- Total CIR Duration: 1,016 samples × 15.65 ps = **15.9 ns**
+- Rise_Time: LOS = 0.042 ns (42 ps), NLOS = 0.025 ns (25 ps)
 
-Each layer modulated independently by context features, then fused for prediction.
+**Corrected Tau Values:**
+
+| Tau Layer | Base τ | Target Phenomenon | Your Signal Scale | Design Rationale |
+|-----------|--------|-------------------|-------------------|------------------|
+| **Small τ** | **0.05 ns (50 ps)** | Rise dynamics (FP→peak) | 25-42 ps | τ ≈ 1-2× rise time for tracking fast edges |
+| **Medium τ** | **1.0 ns** | First bounce / early multipath | 0.5-2 ns (estimated) | Capture intermediate reflections |
+| **Large τ** | **5.0 ns** | Multipath tail distribution | 2-15 ns | Integrate tail energy over 1/3 of CIR |
+
+**Design Principle:** `τ_base ≈ 1-3× signal_feature_duration`
+
+**Dynamic Modulation Range:**
+```python
+τ_dynamic = τ_base × modulation_factor
+modulation_factor = 0.5 to 2.0  # Context-dependent scaling
+```
+
+- **LOS (sharp signal):** Context features → **0.5× multiplier** → faster integration (τ_small = 25 ps)
+- **NLOS (dispersed signal):** Context features → **2.0× multiplier** → slower integration (τ_large = 10 ns max)
+
+Each layer modulated independently by context features (Rise_Time, RiseRatio, E_tail), then fused for prediction.
 
 ### 9.6 EDA Validation Summary
 
