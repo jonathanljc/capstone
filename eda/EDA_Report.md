@@ -1,7 +1,7 @@
 # Exploratory Data Analysis Report
 ## UWB Localization: LOS/NLOS Classification
 
-**Author:** [Your Name]  
+**Author:** [Lim Jing Chuan Jonathan 2300923]  
 **Date:** November 30, 2025  
 **Project:** UWB Indoor Localization System
 
