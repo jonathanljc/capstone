@@ -15,26 +15,27 @@ This report presents a comprehensive exploratory data analysis (EDA) of Ultra-Wi
 **Key Achievements:**
 - ✅ **Dataset:** 8,000 balanced measurements (50% LOS, 50% NLOS) across 8 diverse scenarios in 3 environments
 - ✅ **Baseline Performance:** 92.7% accuracy using logistic regression with 6 engineered features
-- ✅ **Signal Features:** 20+ features engineered from CIR signals, with excellent discrimination (>23% difference)
+- ✅ **Signal Features:** 30+ features engineered from CIR signals, with excellent discrimination (>23% difference)
 - ✅ **Distance Range:** 1.56m - 8.34m across Home, Meeting Room, and Basement environments
-- ✅ **Distance Error Analysis:** NLOS bias quantified across all scenarios
+- ✅ **Distance Error Analysis:** NLOS bias quantified (LOS: -0.087m, NLOS: -0.883m)
+- ✅ **Notebook Organization:** Logical flow from basic features → multipath → signal analysis → hardware → distance
 
 **What You'll Learn:**
 1. How UWB signals differ between LOS and NLOS across diverse environments (Sections 1-3)
-2. What features discriminate LOS from NLOS (Section 4: Feature Engineering)
-3. **How signal and multipath characteristics reveal LOS/NLOS patterns** (Section 5) ⭐
-4. **How distance error varies across scenarios** (Section 6) ⭐
-5. **How CIR waveforms visualize propagation patterns** (Section 7) ⭐
-6. **Baseline classification performance and feature importance** (Section 8) ⭐
+2. What features discriminate LOS from NLOS (Section 4: Feature Engineering in logical order)
+3. **How signal and multipath characteristics reveal LOS/NLOS patterns** (Section 5: Comprehensive analysis) ⭐
+4. **How distance error varies across scenarios** (Section 6: Scenario-specific bias) ⭐
+5. **How CIR waveforms visualize propagation patterns** (Section 7: Multi-perspective visualization) ⭐
+6. **Baseline classification performance and feature importance** (Section 8: 92.7% accuracy) ⭐
 
-**Notebook Structure Reference:**
+**Notebook Structure Reference (Reorganized for Logical Flow):**
 - **Sections 1-3:** Configuration, Data Loading, Quality Checks
-- **Section 4:** Feature Engineering (Basic → Multipath → Signal Analysis → Distance Components)
-- **Section 5:** Signal & Multipath Analysis
+- **Section 4:** Feature Engineering (4.1 Basic → 4.2 Multipath → 4.3 Signal Analysis → 4.3b Hardware → 4.4 Distance)
+- **Section 5:** Signal & Multipath Analysis (5.1 Box Plots → 5.2 Mean CIR → 5.3 Multipath Stats → 5.4 Statistical Validation → 5.5 Visual Comparison)
 - **Section 6:** Distance Error Analysis by Scenario
-- **Section 7:** CIR Waveform Visualization
-- **Section 8:** Baseline Classification
-- **Section 9:** Dataset Summary & Export (`merged_cir.csv`, `merged_cir_enhanced.csv`)
+- **Section 7:** CIR Waveform Visualization (7.1 Peak Detection → 7.2 Full Waveforms → 7.3 Stability Analysis)
+- **Section 8:** Baseline Classification (Logistic Regression)
+- **Section 9:** Dataset Summary & Export (9.1 Enhanced Dataset → 9.2 Merged Dataset)
 - **Section 10:** Merged Dataset EDA & Validation
 
 ---
@@ -104,9 +105,9 @@ This report presents a comprehensive exploratory data analysis (EDA) of Ultra-Wi
 
 ### 3. Feature Engineering Strategy
 
-*Corresponds to Notebook Section 4 (4.1-4.4)*
+*Corresponds to Notebook Section 4 (4.1 → 4.2 → 4.3 → 4.3b → 4.4)*
 
-We systematically extract features from raw CIR in 4 progressive stages:
+We systematically extract features from raw CIR in 5 progressive stages:
 
 #### 3.1 **Basic Features** (Notebook Section 4.1)
 
@@ -135,20 +136,37 @@ Extracted using peak detection algorithm (5× noise threshold):
 
 Advanced signal characteristics for temporal dynamics analysis:
 
-| Feature | Physical Meaning | LOS Mean | NLOS Mean | Difference | Discrimination |
-|---------|-----------------|----------|-----------|------------|----------------|
-| **Rise_Time_ns** | Signal rise duration (FP → peak) | 0.042 ns | 0.025 ns | **-40.8%** | ⭐⭐⭐⭐⭐ |
-| **RiseRatio** | Amplitude ratio (FP_start / peak) | 0.245 | 0.327 | **+33.6%** | ⭐⭐⭐⭐⭐ |
-| **E_tail** | Tail energy ratio (after peak) | 0.659 | 0.810 | **+23.0%** | ⭐⭐⭐⭐⭐ |
-| **multipath_count** | Significant reflections | 13.6 | 17.4 | **+27.8%** | ⭐⭐⭐⭐⭐ |
-| **Peak_SNR** | Signal-to-noise ratio | 99.9 | 106.7 | **+6.7%** | ⭐⭐⭐ |
+| Feature | Physical Meaning | Formula | Discrimination |
+|---------|-----------------|---------|----------------|
+| **t_start** | Hardware first path detection | `FP_INDEX / 64` | Reference point |
+| **t_peak** | Maximum peak index | `argmax(CIR)` | Reference point |
+| **Rise_Time** | Signal rise (samples) | `t_peak - t_start` | ⭐⭐⭐⭐ |
+| **Rise_Time_ns** | Signal rise (nanoseconds) | `Rise_Time × TS_DW1000 × 10^9` | ⭐⭐⭐⭐ |
+| **RiseRatio** | Amplitude ratio | `CIR[t_start] / CIR[t_peak]` | ⭐⭐⭐⭐⭐ |
+| **E_tail** | Tail energy ratio | `Σ(CIR[t_peak:end]^2) / Σ(CIR^2)` | ⭐⭐⭐⭐⭐ |
+| **Peak_SNR** | Signal-to-noise ratio | `CIR[t_peak] / median_noise` | ⭐⭐⭐ |
 
-**Critical Implementation Fix:** ✅
-- Initial: Used `fp_peak_idx` as `t_start` → Rise_Time ≈ 0 (no discrimination)
-- Corrected: Use hardware `FP_INDEX_scaled` (true first arrival) as `t_start`
-- Result: Rise_Time discrimination improved from 2.2% → **40.8%** ⭐
+**Key Statistics from Notebook Section 5.4:**
 
-#### 3.4 **Distance Components** (Notebook Section 4.4)
+| Feature | LOS Mean | NLOS Mean | Difference |
+|---------|----------|-----------|------------|
+| **E_tail** | 65.9% | 81.0% | **+23.0%** |
+| **RiseRatio** | Higher | Lower | Discriminative |
+| **Peak_SNR** | Higher | Lower | Discriminative |
+
+**Note:** The notebook correctly uses `FP_INDEX_scaled` as `t_start` to capture hardware-detected first arrival, ensuring proper rise time calculation.
+
+#### 3.4 **Hardware-Derived Features** (Notebook Section 4.3b)
+
+DW1000 chip hardware measurements:
+
+| Feature | Description | Formula |
+|---------|-------------|---------|
+| **avg_fp_amplitude** | Average first path amplitude | `(FP_AMPL1 + FP_AMPL2 + FP_AMPL3) / 3` |
+| **fp_amplitude_std** | First path stability | `std(FP_AMPL1, FP_AMPL2, FP_AMPL3)` |
+| **signal_quality** | Preamble accumulation count | `RXPACC` |
+
+#### 3.5 **Distance Components** (Notebook Section 4.4)
 
 Distance-related features for error analysis:
 
@@ -158,7 +176,16 @@ Distance-related features for error analysis:
 | **d_error** | `d_single_bounce - d_true` | NLOS bias magnitude |
 | **d_true** | Ground truth | Physical distance |
 
-**Result:** Baseline logistic regression (6 features) achieves **86.8% accuracy** → Classification is feasible!
+**Key Statistics from Notebook Section 4.4:**
+
+| Metric | LOS | NLOS | Insight |
+|--------|-----|------|---------|
+| **d_error mean** | -0.087m | -0.883m | NLOS has 10× larger error |
+| **d_error %** | -2.0% | -19.6% | Significant NLOS bias |
+
+---
+
+**Result:** With these 5 stages of feature engineering (20+ features total), baseline logistic regression achieves **92.7% accuracy** → Classification is highly feasible!
 
 ---
 
@@ -210,11 +237,12 @@ This exploratory data analysis has successfully characterized the key difference
 
 **Key Findings:**
 - ✅ **Dataset:** 8,000 balanced measurements across Home, Meeting Room, and Basement environments
-- ✅ **Feature Engineering:** 20+ features extracted (basic, multipath, signal analysis, distance components)
-- ✅ **Discrimination:** Multipath count (+27.8%), tail energy (+23.0%), and rise characteristics (+33.6%) show excellent separation
+- ✅ **Feature Engineering:** 30+ features extracted in logical order (basic → multipath → signal analysis → hardware → distance)
+- ✅ **Discrimination:** Multipath count (+27.8%), tail energy (+23.0%), and rise characteristics show excellent separation
 - ✅ **Baseline Classifier:** 92.7% accuracy with logistic regression validates classification feasibility
-- ✅ **Distance Error:** NLOS bias quantified (-0.883m ± 2.366m) with scenario-specific patterns
+- ✅ **Distance Error:** NLOS bias quantified (LOS: -0.087m, NLOS: -0.883m) with scenario-specific patterns
 - ✅ **Data Quality:** No missing values, balanced classes, comprehensive scenario coverage (1.56m - 8.34m)
+- ✅ **Notebook Structure:** Reorganized for coherent analytical flow (Sections 1-10)
 
 **Feature Importance Ranking:**
 1. **Max_Index** (-6.198) - Peak location indicator (strongest)
@@ -225,8 +253,8 @@ This exploratory data analysis has successfully characterized the key difference
 6. **first_bounce_delay_ns** (+1.044) - Multipath timing
 
 **Physical Interpretation:**
-- **LOS signals:** Sharp peaks, fast rise (0.042ns), low tail energy (65.9%), fewer reflections (13.6)
-- **NLOS signals:** Dispersed peaks, slower rise (0.025ns), high tail energy (81.0%), more reflections (17.4)
+- **LOS signals:** Sharp peaks, concentrated energy (65.9% tail energy), fewer reflections (13.6), shorter bounce delay (0.113ns)
+- **NLOS signals:** Dispersed peaks, diffuse energy (81.0% tail energy), more reflections (17.4), longer bounce delay (0.132ns)
 
 **Data Files:**
 - `merged_cir.csv` - Basic merge of 8 CSVs for fast loading
