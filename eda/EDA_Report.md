@@ -14,7 +14,7 @@ This report presents a comprehensive exploratory data analysis (EDA) of Ultra-Wi
 
 **Key Achievements:**
 - ✅ **Dataset:** 8,000 balanced measurements (50% LOS, 50% NLOS) across 8 diverse scenarios in 3 environments
-- ✅ **Baseline Performance:** 86.8% accuracy using logistic regression with 6 engineered features
+- ✅ **Baseline Performance:** 92.7% accuracy using logistic regression with 6 engineered features
 - ✅ **Signal Features:** 20+ features engineered from CIR signals, with excellent discrimination (>23% difference)
 - ✅ **Distance Range:** 1.56m - 8.34m across Home, Meeting Room, and Basement environments
 - ✅ **Distance Error Analysis:** NLOS bias quantified across all scenarios
@@ -177,28 +177,28 @@ Distance-related features for error analysis:
 
 | Metric | Value |
 |--------|-------|
-| **Overall Accuracy** | **86.8%** |
-| **LOS Precision/Recall** | 85.7% / 88.2% |
-| **NLOS Precision/Recall** | 87.9% / 85.3% |
-| **F1-Score (avg)** | 86.7% |
+| **Overall Accuracy** | **92.7%** |
+| **LOS Precision/Recall** | 91.1% / 94.6% |
+| **NLOS Precision/Recall** | 94.4% / 90.8% |
+| **F1-Score (avg)** | 92.7% |
 
-**Confusion Matrix (Test Set, n=800):**
+**Confusion Matrix (Test Set, n=1600):**
 
 |              | Predicted LOS | Predicted NLOS |
 |--------------|---------------|----------------|
-| **Actual LOS**  | 353 (88.2%)   | 47 (11.8%)     |
-| **Actual NLOS** | 59 (14.8%)    | 341 (85.3%)    |
+| **Actual LOS**  | 757 (94.6%)   | 43 (5.4%)      |
+| **Actual NLOS** | 74 (9.2%)     | 726 (90.8%)    |
 
 **Feature Importance (Logistic Regression Coefficients):**
 
 | Rank | Feature | Coefficient | Interpretation |
 |------|---------|-------------|----------------|
-| 1 | **Max_Index** | -6.750 | Earlier max peak → LOS |
-| 2 | **FP_INDEX_scaled** | +6.092 | Later first path → NLOS (penetration delay) |
-| 3 | **first_bounce_delay_ns** | +1.658 | Longer bounce delay → NLOS |
-| 4 | **fp_peak_amp** | -1.258 | Higher amplitude → LOS |
-| 5 | **multipath_count** | +1.251 | More peaks → NLOS |
-| 6 | **roi_energy** | -0.786 | Higher energy → LOS (weak) |
+| 1 | **Max_Index** | -6.198 | Earlier max peak → LOS |
+| 2 | **fp_peak_amp** | -5.548 | Higher amplitude → LOS |
+| 3 | **roi_energy** | -3.472 | Higher energy → LOS |
+| 4 | **FP_INDEX_scaled** | +3.426 | Later first path → NLOS (penetration delay) |
+| 5 | **multipath_count** | +3.030 | More peaks → NLOS |
+| 6 | **first_bounce_delay_ns** | +1.044 | Longer bounce delay → NLOS |
 
 **Key Insight:** Index-based temporal features (Max_Index, FP_INDEX_scaled) are the strongest discriminators!
 
@@ -212,17 +212,17 @@ This exploratory data analysis has successfully characterized the key difference
 - ✅ **Dataset:** 8,000 balanced measurements across Home, Meeting Room, and Basement environments
 - ✅ **Feature Engineering:** 20+ features extracted (basic, multipath, signal analysis, distance components)
 - ✅ **Discrimination:** Multipath count (+27.8%), tail energy (+23.0%), and rise characteristics (+33.6%) show excellent separation
-- ✅ **Baseline Classifier:** 86.8% accuracy with logistic regression validates classification feasibility
+- ✅ **Baseline Classifier:** 92.7% accuracy with logistic regression validates classification feasibility
 - ✅ **Distance Error:** NLOS bias quantified (-0.883m ± 2.366m) with scenario-specific patterns
 - ✅ **Data Quality:** No missing values, balanced classes, comprehensive scenario coverage (1.56m - 8.34m)
 
 **Feature Importance Ranking:**
-1. **FP_INDEX_scaled** (+3.145) - Hardware first-path detection (strongest)
-2. **Max_Index** (-2.634) - Peak location indicator
-3. **first_bounce_delay_ns** (+1.515) - Multipath timing
-4. **fp_peak_amp** (-1.320) - Signal amplitude
-5. **multipath_count** (+1.251) - Reflection count
-6. **roi_energy** (-0.786) - Signal energy (weaker)
+1. **Max_Index** (-6.198) - Peak location indicator (strongest)
+2. **fp_peak_amp** (-5.548) - Signal amplitude
+3. **roi_energy** (-3.472) - Signal energy
+4. **FP_INDEX_scaled** (+3.426) - Hardware first-path detection
+5. **multipath_count** (+3.030) - Reflection count
+6. **first_bounce_delay_ns** (+1.044) - Multipath timing
 
 **Physical Interpretation:**
 - **LOS signals:** Sharp peaks, fast rise (0.042ns), low tail energy (65.9%), fewer reflections (13.6)
