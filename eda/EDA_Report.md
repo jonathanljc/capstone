@@ -92,14 +92,24 @@ This report presents a comprehensive exploratory data analysis (EDA) of Ultra-Wi
 |---------------|--------------|---------------|
 | **Peak sharpness** | Sharp, narrow peak | Broader, dispersed peak |
 | **Signal decay** | Rapid fall-off after peak | Gradual decay with oscillations |
-| **Multipath components** | Fewer reflections (13.6 avg) | More reflections (17.4 avg) → **+27.8%** |
-| **First bounce delay** | Shorter (0.113 ns) | Longer (0.132 ns) → **+16.8%** |
-| **Tail energy** | Concentrated (65.9%) | Dispersed (81.0%) → **+23.0%** |
+| **Multipath components** | Fewer reflections (12.3 avg) | More reflections (23.2 avg) → **+87.7%** |
+| **Inter-peak spacing** | Sparse reflections (0.128 ns) | Dense clusters (0.123 ns) → **-4.0%** ⚠️ |
+| **Tail energy** | Less dispersed (61.9%) | More dispersed (72.7%) → **+17.4%** |
 | **Waveform stability** | Low variance | High variance |
 
 **Physical Interpretation:**
 - **LOS:** Direct path dominates, minimal multipath interference → clean, sharp signal
 - **NLOS:** Signal penetrates/diffracts through obstacles → delayed, spread-out, multipath-rich signal
+
+⚠️ **Critical Note on Inter-Peak Spacing (Counter-Intuitive Result):**
+
+The **first_bounce_delay** metric shows NLOS having SHORTER values (-4.0%) than LOS, which may seem counter-intuitive at first. This is actually physically correct:
+
+- **What it measures:** Time spacing BETWEEN consecutive detected peaks (inter-peak spacing), NOT absolute delay from signal transmission
+- **LOS behavior:** Few, sparse room reflections → LARGER gaps between peaks (0.128 ns ≈ 8.2 samples)
+- **NLOS behavior:** Dense multipath cluster from obstacle penetration/diffraction → SMALLER gaps between peaks (0.123 ns ≈ 7.9 samples)
+
+**Key insight:** NLOS has MORE peaks total (+87.7%) packed into a denser temporal cluster, while LOS has FEWER peaks spread farther apart. This metric captures multipath density, not signal arrival time. The result is physically plausible and confirmed by code verification.
 
 ---
 
@@ -128,9 +138,11 @@ Extracted using peak detection algorithm (5× noise threshold):
 | Feature | Description | LOS Mean | NLOS Mean | Difference |
 |---------|-------------|----------|-----------|------------|
 | **fp_peak_amp** | Amplitude at first path peak | Higher | Lower | More direct signal |
-| **first_bounce_idx** | Index of first multipath bounce | Earlier | Later | Delayed reflections |
-| **first_bounce_delay_ns** | Time to first bounce | 0.113 ns | 0.132 ns | **+16.8%** |
-| **multipath_count** | Number of detected peaks | 13.6 | 17.4 | **+27.8%** |
+| **first_bounce_idx** | Index of first multipath bounce | Variable | Variable | Context dependent |
+| **first_bounce_delay_ns** | Inter-peak spacing (gap between peaks) ⚠️ | 0.128 ns | 0.123 ns | **-4.0%** (denser) |
+| **multipath_count** | Number of detected peaks | 12.3 | 23.2 | **+87.7%** (more peaks) |
+
+⚠️ **Note:** Despite the name "first_bounce_delay", this metric measures the time GAP between consecutive detected peaks (inter-peak spacing), not the absolute delay from transmission. NLOS shows shorter spacing because multipath components cluster more densely in time, while LOS has sparse, widely-spaced reflections. See Physical Signal Characteristics section for detailed interpretation.
 
 #### 3.3 **Signal Analysis Features** (Notebook Section 4.3)
 
@@ -150,9 +162,9 @@ Advanced signal characteristics for temporal dynamics analysis:
 
 | Feature | LOS Mean | NLOS Mean | Difference |
 |---------|----------|-----------|------------|
-| **E_tail** | 65.9% | 81.0% | **+23.0%** |
-| **RiseRatio** | Higher | Lower | Discriminative |
-| **Peak_SNR** | Higher | Lower | Discriminative |
+| **E_tail** | 61.9% | 72.7% | **+17.4%** |
+| **RiseRatio** | 0.251 | 0.248 | **-1.0%** (minimal) |
+| **Peak_SNR** | 98.5 | 90.8 | **-7.8%** (LOS higher) |
 
 **Note:** The notebook correctly uses `FP_INDEX_scaled` as `t_start` to capture hardware-detected first arrival, ensuring proper rise time calculation.
 
@@ -238,7 +250,7 @@ This exploratory data analysis has successfully characterized the key difference
 **Key Findings:**
 - ✅ **Dataset:** 8,000 balanced measurements across Home, Meeting Room, and Basement environments
 - ✅ **Feature Engineering:** 30+ features extracted in logical order (basic → multipath → signal analysis → hardware → distance)
-- ✅ **Discrimination:** Multipath count (+27.8%), tail energy (+23.0%), and rise characteristics show excellent separation
+- ✅ **Discrimination:** Multipath count (+87.7% NLOS increase), tail energy (+17.4%), Peak SNR show excellent separation
 - ✅ **Baseline Classifier:** 92.7% accuracy with logistic regression validates classification feasibility
 - ✅ **Distance Error:** NLOS bias quantified (LOS: -0.087m, NLOS: -0.883m) with scenario-specific patterns
 - ✅ **Data Quality:** No missing values, balanced classes, comprehensive scenario coverage (1.56m - 8.34m)
@@ -253,8 +265,8 @@ This exploratory data analysis has successfully characterized the key difference
 6. **first_bounce_delay_ns** (+1.044) - Multipath timing
 
 **Physical Interpretation:**
-- **LOS signals:** Sharp peaks, concentrated energy (65.9% tail energy), fewer reflections (13.6), shorter bounce delay (0.113ns)
-- **NLOS signals:** Dispersed peaks, diffuse energy (81.0% tail energy), more reflections (17.4), longer bounce delay (0.132ns)
+- **LOS signals:** Sharp peaks, concentrated energy (61.9% tail energy), fewer reflections (12.3), higher SNR (98.5)
+- **NLOS signals:** Dispersed peaks, diffuse energy (72.7% tail energy), significantly more reflections (23.2), lower SNR (90.8)
 
 **Data Files:**
 - `merged_cir.csv` - Basic merge of 8 CSVs for fast loading
