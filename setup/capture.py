@@ -1,7 +1,7 @@
 import pandas as pd
 
 LOG_FILE = r'C:\Users\preca\cir_data\putty.log'
-OUTPUT_FILE = r'C:\Users\preca\cir_data\4.4m_corner_nlos_home.csv'
+OUTPUT_FILE = r'C:\Users\preca\cir_data\4.63m_table_laptop_nlos_MR201SIT.csv'
 
 print(f"Reading {LOG_FILE}...")
 
