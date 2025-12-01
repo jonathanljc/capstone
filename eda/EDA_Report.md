@@ -141,6 +141,17 @@ Extracted using peak detection algorithm (5× noise threshold):
 | **first_bounce_idx** | Index of first multipath bounce | Variable | Variable | Context dependent |
 | **first_bounce_delay_ns** | Inter-peak spacing (gap between peaks) ⚠️ | 0.128 ns | 0.123 ns | **-4.0%** (denser) |
 | **multipath_count** | Number of detected peaks | 12.3 | 23.2 | **+87.7%** (more peaks) |
+| **bounce_pattern** | Multipath density classification | See below | See below | Strong discriminator |
+
+**Bounce Pattern Distribution (Notebook Section 4.2):**
+
+| Pattern | Description | LOS Count | NLOS Count | LOS % | NLOS % |
+|---------|-------------|-----------|------------|-------|--------|
+| **clean** | Minimal multipath (≤8 peaks) | 128 | 4 | 3.2% | 0.1% |
+| **single_bounce** | Moderate multipath (9-15 peaks) | 3,459 | 945 | 86.5% | 23.6% |
+| **multi_bounce** | Dense multipath (16+ peaks) | 413 | 3,051 | 10.3% | 76.3% |
+
+**Key Insight:** NLOS is **7.4× more likely** to exhibit multi_bounce pattern than LOS. 90% of LOS signals are clean or single_bounce, while 76% of NLOS signals are multi_bounce.
 
 ⚠️ **Note:** Despite the name "first_bounce_delay", this metric measures the time GAP between consecutive detected peaks (inter-peak spacing), not the absolute delay from transmission. NLOS shows shorter spacing because multipath components cluster more densely in time, while LOS has sparse, widely-spaced reflections. See Physical Signal Characteristics section for detailed interpretation.
 
@@ -197,7 +208,7 @@ Distance-related features for error analysis:
 
 ---
 
-**Result:** With these 5 stages of feature engineering (20+ features total), baseline logistic regression achieves **92.7% accuracy** → Classification is highly feasible!
+**Result:** With these 5 stages of feature engineering (30+ features including bounce_pattern classification), baseline logistic regression achieves **92.7% accuracy** → Classification is highly feasible!
 
 ---
 
