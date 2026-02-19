@@ -10,29 +10,30 @@ Raw CIR (1016 samples)
 │  Stage 1: PI-HLNN                │
 │  Task: LOS vs NLOS classification│
 │  Model: Liquid Neural Network    │
-│  Output: binary label + 48-dim   │
-│          hidden state embeddings │
+│  Output: binary label + 64-dim   │
+│          LNN embeddings          │
 └──────────┬───────────────────────┘
            │
            │  Freeze encoder weights
-           │  Extract 48-dim embeddings
+           │  Extract 64-dim embeddings
+           │  (mean-pooled hidden states)
            │
     ┌──────┴──────┐
     ▼             ▼
 ┌────────────┐ (only NLOS samples pass through)
 │            │
-│  Stage 2: Random Forest Classifier          │
-│  Task: Single-bounce vs Multi-bounce        │
-│  Input: 48-dim LNN embeddings               │
-│  Output: bounce type label                  │
-└────────────┬────────────────────────────────┘
+│  Stage 2: Random Forest Classifier      │
+│  Task: Single-bounce vs Multi-bounce    │
+│  Input: 64-dim LNN embeddings           │
+│  Output: bounce type label              │
+└────────────┬────────────────────────────┘
              │
              │ (only single-bounce samples pass through)
              ▼
 ┌─────────────────────────────────────────────┐
 │  Stage 3: Random Forest Regressor           │
 │  Task: Predict NLOS ranging bias (meters)   │
-│  Input: 48-dim LNN embeddings               │
+│  Input: 64-dim LNN embeddings               │
 │  Output: predicted bias → d_corrected       │
 └─────────────────────────────────────────────┘
 ```
@@ -87,58 +88,140 @@ Standard RNNs use fixed time constants. Liquid Neural Networks (LNNs) model neur
 ### Architecture
 
 ```
-PI_HLNN (7,233 parameters)
-├── PILiquidCell (recurrent cell, processes 1 timestep at a time)
-│   ├── synapse:  Linear(49 → 48)     — maps [x_t, h_prev] to synaptic input
-│   ├── tau_net:  Linear(49 → 32) → Tanh → Linear(32 → 48)  — predicts time constants
-│   └── A:        Parameter(48)        — learnable decay rates, initialized to -0.5
+PI_HLNN (~18,946 params — conductance-based LTC, Hasani et al.)
+├── PILiquidCell (recurrent cell, processes 1 timestep via semi-implicit Euler)
+│   ├── Neuron intrinsic parameters (per neuron):
+│   │   ├── gleak:   Parameter(64)        — leak conductance (how fast neuron forgets)
+│   │   ├── vleak:   Parameter(64)        — resting potential (equilibrium voltage)
+│   │   └── cm:      Parameter(64)        — membrane capacitance (neuron sluggishness)
+│   │
+│   ├── Recurrent synapses (conductance-based, 64×64):
+│   │   ├── w:       Parameter(64, 64)    — synaptic conductance strength
+│   │   ├── erev:    Parameter(64, 64)    — reversal potential (excitatory/inhibitory)
+│   │   ├── mu:      Parameter(64, 64)    — activation threshold per synapse
+│   │   └── sigma:   Parameter(64, 64)    — gate sensitivity (sharpness)
+│   │
+│   └── Sensory synapses (gated additive input, 1×64):
+│       ├── sensory_w:     Parameter(1, 64) — input conductance per neuron
+│       ├── sensory_mu:    Parameter(1, 64) — CIR amplitude threshold
+│       └── sensory_sigma: Parameter(1, 64) — input gate sharpness
 │
-└── Classifier (applied to mean-pooled hidden state after all 60 timesteps)
-    ├── Linear(48 → 32)
+├── Attention Pooling (learns which timesteps matter)
+│   └── attn:         Linear(64 → 1)      — temporal importance scoring
+│
+└── Classifier (applied to attention-pooled hidden state after all 60 timesteps)
+    ├── Linear(64 → 32)
     ├── SiLU activation
     ├── Dropout(0.4)
     ├── Linear(32 → 1)
     └── Sigmoid
 ```
 
+### Parameter Count (~18,946 at h=64)
+
+| Component | Formula | Count |
+|-----------|---------|-------|
+| Recurrent (w, erev, mu, sigma) | 4 × 64² | 16,384 |
+| Sensory (w, mu, sigma) | 3 × 1 × 64 | 192 |
+| Neuron (gleak, vleak, cm) | 3 × 64 | 192 |
+| Attention | 64 + 1 | 65 |
+| Classifier | (64×32 + 32) + (32×1 + 1) | 2,113 |
+| **Total** | | **~18,946** |
+
+**Comparable to LSTM (19,265)** — but with physics-interpretable ODE dynamics.
+
+### Parameter Initialization (Tutorial-Style)
+
+Following the conductance-based LTC tutorial (KPEKEP/LTCtutorial):
+
+| Parameter | Init Range | Rationale |
+|-----------|-----------|-----------|
+| `gleak` | [0.001, 1.0] | Positive leak conductance |
+| `vleak` | [-0.2, 0.2] | Small resting potential |
+| `cm` | [0.4, 0.6] | Moderate capacitance |
+| `w` | [0.001, 1.0] | Positive synaptic weights |
+| `erev` | [-0.2, 0.2] | Mix of excitatory/inhibitory |
+| `mu` | **[0.3, 0.8]** | Centered in active voltage range |
+| `sigma` | **[3, 8]** | Sharp sensitivity for clear gating |
+| `sensory_w` | [0.001, 1.0] | Positive input conductance |
+| `sensory_mu` | [0.3, 0.8] | Centered in input range [0, 1] |
+| `sensory_sigma` | [3, 8] | Sharp sensitivity for input gates |
+
+### Positivity Enforcement: softplus on Conductances Only
+
+Only parameters that represent **conductances** (must be positive) use `F.softplus(x) = log(1 + exp(x))`:
+- **softplus applied**: `gleak`, `cm`, `w`, `sensory_w`
+- **NOT applied**: `sigma`, `sensory_sigma` (gate sensitivity — allowed to use raw values)
+
+This matches the tutorial's pattern: sigma controls gate sharpness and is initialized in a range [3, 8] where the raw value is already positive and meaningful. Applying softplus to sigma would compress the effective range and reduce gradient flow.
+
 ### ODE Dynamics (the core of the LNN)
 
-At each timestep t, the cell computes:
+The ODE per neuron i (Hodgkin-Huxley inspired):
 
 ```
-combined = concat(x_t, h_prev)           # shape: (batch, 49)
-
-tau_t    = dt + softplus(tau_net(combined))   # shape: (batch, 48)
-S_t      = tanh(synapse(combined))            # shape: (batch, 48)
-
-h_new    = (h_prev + dt * S_t * A) / (1 + dt / tau_t)
+cm_i * dV_i/dt = -gleak_i * (V_i - vleak_i)                                          ← leak current
+                 + Σ_j [ w_ji * σ(sigma_ji * (V_j - mu_ji)) * (erev_ji - V_i) ]       ← recurrent synapses
+                 + Σ_k [ sensory_w_ki * σ(sensory_sigma_ki * (I_k - sensory_mu_ki)) * I_k ]  ← sensory input
 ```
 
-**What each component does**:
+Solved with **semi-implicit Euler** (unconditionally stable, 6 sub-steps per timestep):
 
-| Component | Formula | Role |
-|-----------|---------|------|
-| `tau_t` | `dt + softplus(...)` | **Time constant** — how quickly each neuron responds. Minimum value = dt (=1.0), ensuring stability. Larger tau = slower response (memory persists). Smaller tau = faster response (reacts to new input). |
-| `S_t` | `tanh(synapse([x_t, h_prev]))` | **Synaptic input** — the "force" driving the neuron. Combines current CIR sample with previous state. |
-| `A` | Learnable parameter | **Decay rate** — initialized to -0.5, controls how the driving force scales. Negative values create stable dynamics. |
-| `h_new` | `(h + dt*S*A) / (1 + dt/tau)` | **Euler discretization** of the ODE: `tau * dh/dt = -h + S*A`. This is the leaky integrator equation. |
+```
+# Sensory current (computed once per timestep — independent of v):
+sensory_gate    = sigmoid(sensory_sigma * (x_t - sensory_mu))     # (batch, input, hidden)
+sensory_current = Σ_k (softplus(sensory_w) * sensory_gate * x_t)  # gated additive input
 
-**Why softplus for tau?**
-- Previous version used `1 + 5 * sigmoid(...)` → tau range [1, 6] (artificially bounded)
-- Current version uses `dt + softplus(...)` → tau range [1, ∞) (naturally bounded below, unconstrained above)
-- Softplus is smooth and differentiable everywhere, better for gradient flow
+# Per ODE sub-step:
+recurrent_gate  = sigmoid(sigma * (v_pre - mu))                   # (batch, h_pre, h_post)
+w_gate          = softplus(w) * recurrent_gate
+
+v_new = (cm_t * v + softplus(gleak) * vleak + Σ w_gate * erev + sensory_current)
+      / (cm_t + softplus(gleak) + Σ w_gate + ε)
+
+# After all timesteps:
+attn_w   = softmax(attn(h_all), dim=time)                        # (batch, 60, 1)
+h_pooled = sum(h_all * attn_w, dim=time)                          # (batch, 64)
+
+# Emergent time constant (for diagnostics):
+tau_eff = cm / (gleak + Σ w_gate)
+```
+
+**Key design choice**: The sensory current uses a **gated additive** formulation — it only contributes to the numerator, not the denominator. This keeps sensory input as a direct driving force on the neuron voltage without dampening responsiveness. The recurrent synapses use full conductance-based formulation (with reversal potentials in both numerator and denominator), which provides stability for the recurrent dynamics while allowing the input signal to flow freely.
+
+**What each component does (white-box)**:
+
+| Component | Role |
+|-----------|------|
+| `gleak` | **Leak conductance** — how quickly neuron i forgets (high = short memory) |
+| `vleak` | **Resting potential** — value neuron relaxes to when unstimulated |
+| `cm` | **Membrane capacitance** — neuron sluggishness (high = slow, low = fast) |
+| `w[j,i]` | **Synaptic conductance** — strength of connection from neuron j to i |
+| `erev[j,i]` | **Reversal potential** — determines excitatory (erev > V) or inhibitory (erev < V) |
+| `mu[j,i]` | **Activation threshold** — neuron j must exceed mu for synapse to fire |
+| `sigma[j,i]` | **Gate sensitivity** — how sharply the synapse turns on/off |
+| `sensory_w` | **Input conductance** — how much CIR input drives each neuron |
+| `sensory_mu` | **Input threshold** — what CIR amplitude activates this synapse |
+| `attn_w` | **Attention pooling** — learned temporal importance weights |
+| `tau_eff` | **Emergent time constant** — NOT explicitly set; emerges from cm, gleak, and synaptic activity |
+
+**Why semi-implicit Euler?**
+- LTC ODEs are **stiff** — standard explicit Euler would require very small steps
+- Semi-implicit Euler is unconditionally stable: no gradient explosion from ODE dynamics
+- 6 sub-steps per timestep balances accuracy vs computation cost
 
 ### Pooling: From Sequence to Fixed Vector
 
 After processing all 60 timesteps, we have 60 hidden states. These are aggregated into a single vector:
 
 ```
-h_pooled = (h_1 + h_2 + ... + h_60) / 60    # shape: (batch, 48)
+attn_weights = softmax(attn(h_all))          # learned temporal importance
+h_pooled = sum(h_all * attn_weights)         # shape: (batch, 64)
 ```
 
-This **mean-pooled hidden state** serves two purposes:
+This **attention-pooled hidden state** serves two purposes:
 1. **Stage 1**: Fed into the classifier head for LOS/NLOS prediction
-2. **Stages 2 & 3**: Used as the 48-dim embedding (feature vector) for downstream Random Forests
+2. **Stages 2 & 3**: Mean-pooled hidden states form 64-dim LNN embeddings for downstream Random Forests
 
 ### Training Configuration
 
@@ -156,8 +239,8 @@ This **mean-pooled hidden state** serves two purposes:
 
 ### Output
 - **Prediction**: scalar in [0, 1], thresholded at 0.5 → LOS (0) or NLOS (1)
-- **Tau mean**: 48-dim vector of average time constants (diagnostic, not used in loss)
-- **Validation accuracy**: ~94.6%
+- **Tau mean**: 64-dim vector of average time constants (used for diagnostics only)
+- **Validation accuracy**: ~94.8%
 
 ### Freezing for Downstream Use
 
@@ -184,21 +267,29 @@ def extract_lnn_embeddings(model, data_df, batch_size=256):
     with torch.no_grad():
         for batch in batches(X_tensor, batch_size):
             _, h_hist, _, _ = model(batch, return_dynamics=True)
-            # h_hist shape: (batch, 60, 48) — all 60 hidden states
-            emb = h_hist.mean(dim=1)   # (batch, 48) — mean pool over time
-            all_embeddings.append(emb.cpu().numpy())
+            embedding = h_hist.mean(dim=1)   # (batch, 64) mean pooling
+            all_embeddings.append(embedding.cpu().numpy())
 
-    return np.vstack(all_embeddings)   # (N, 48)
+    return np.vstack(all_embeddings)   # (N, 64)
 ```
 
-**What the 48 dimensions represent**:
-Each dimension (`LNN_h0` through `LNN_h47`) is one neuron's average activation across the 60 timesteps. The encoder learned these representations during LOS/NLOS classification — they capture signal characteristics like:
-- Multipath structure (multiple reflections show up as temporal patterns)
-- Signal decay rate (how quickly energy drops after the peak)
-- Delay spread (how wide the impulse response is)
-- Peak sharpness (concentrated vs diffuse energy)
+### 64-dim Mean-Pooled LNN Embeddings
 
-These are richer than the 3 hand-crafted features because the network discovers whatever patterns are most discriminative, rather than relying on human-designed metrics.
+The embedding is the **mean of all hidden states across the 60 timesteps**:
+
+```python
+embedding = h_hist.mean(dim=1)  # (batch, 64)
+```
+
+| Dimensions | Source | What it captures |
+|-----------|--------|-----------------|
+| `LNN_0` – `LNN_63` | Mean-pooled hidden states | Signal structure, multipath patterns, temporal dynamics |
+
+**Why mean pooling works well**:
+- Each hidden state at timestep t contains the neuron voltages after processing the CIR up to that point
+- Mean pooling aggregates information from all timesteps, capturing the full temporal evolution
+- The 64-dim embeddings contain rich representations learned by the conductance-based ODE dynamics
+- The effective time constant τ = cm/(gleak + Σ w·gate) is implicitly encoded in the hidden state evolution
 
 ---
 
@@ -228,8 +319,8 @@ peaks = find_peaks(roi_normalized, prominence=0.20, distance=5)
 
 ### Input Features
 ```
-48-dim LNN embeddings from frozen Stage 1 PI-HLNN encoder
-Shape: (N_nlos, 48)
+64-dim LNN embeddings from frozen Stage 1 PI-HLNN encoder
+Shape: (N_nlos, 64)
 ```
 
 These replace the previously used 3 hand-crafted features (Kurtosis, RMS_Delay_Spread, Power_Ratio).
@@ -249,7 +340,7 @@ RandomForestClassifier(
 
 **Why Random Forest?**
 - No scaling needed (trees are scale-invariant)
-- Handles the 48-dim embedding space well
+- Handles the 64-dim embedding space well
 - Fast training, no hyperparameter-sensitive training loop
 - `class_weight='balanced'` handles the slight class imbalance (~50/50 in this case)
 
@@ -260,7 +351,7 @@ Train NLOS (1260 samples)
     │
     ├── extract_features_from_df() → Num_Peaks → auto-labels (used for y)
     │
-    └── extract_lnn_embeddings()   → (1260, 48) embeddings (used for X)
+    └── extract_lnn_embeddings()   → (1260, 64) embeddings (used for X)
 
 RF.fit(X_train, y_train)
 ```
@@ -294,8 +385,8 @@ Each sample's bias target is looked up by its distance group (from the source fi
 
 ### Input Features
 ```
-48-dim LNN embeddings from frozen Stage 1 PI-HLNN encoder
-Shape: (N_single_bounce, 48)
+64-dim LNN embeddings from frozen Stage 1 PI-HLNN encoder
+Shape: (N_single_bounce, 64)
 ```
 
 **Key efficiency**: Stage 3 doesn't re-extract embeddings. It **indexes into Stage 2's embedding array** for the single-bounce subset:
@@ -318,11 +409,11 @@ RandomForestRegressor(
 ### Data Flow
 
 ```
-NLOS embeddings from Stage 2: (1260, 48)
+NLOS embeddings from Stage 2: (1260, 64)
     │
     ├── Filter: Num_Peaks <= 2 AND has known ground truth bias
     │
-    └── Single-bounce subset: (~586, 48) with bias targets [5.00, 5.32, 2.80]
+    └── Single-bounce subset: (~586, 64) with bias targets [5.00, 5.32, 2.80]
 
 RF.fit(X_train, y_train)
 ```
@@ -389,10 +480,10 @@ Input: 540 test CIR signals
 | Aspect | Stage 1 | Stage 2 | Stage 3 |
 |--------|---------|---------|---------|
 | **Task** | LOS/NLOS classification | Bounce type classification | Bias prediction |
-| **Model** | PI-HLNN (LNN) | Random Forest Classifier | Random Forest Regressor |
-| **Parameters** | 7,233 | 200 trees | 200 trees |
-| **Input** | Raw 60-sample CIR window | 48-dim LNN embeddings | 48-dim LNN embeddings |
-| **Input shape** | (N, 60, 1) | (N_nlos, 48) | (N_single, 48) |
+| **Model** | PI-HLNN (conductance-based LTC) | Random Forest Classifier | Random Forest Regressor |
+| **Parameters** | ~18,946 (h=64) | 200 trees | 200 trees |
+| **Input** | Raw 60-sample CIR window | 64-dim LNN embeddings | 64-dim LNN embeddings |
+| **Input shape** | (N, 60, 1) | (N_nlos, 64) | (N_single, 64) |
 | **Output** | LOS (0) / NLOS (1) | Single (0) / Multi (1) | Bias in meters |
 | **Loss/Metric** | BCE / Accuracy | — / Accuracy | — / MAE |
 | **Training** | AdamW, 40 epochs | .fit() | .fit() |
