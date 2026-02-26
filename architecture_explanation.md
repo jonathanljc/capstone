@@ -4,9 +4,9 @@
 
 The DualCircuit_PI_HLNN is a binary classifier (LOS vs NLOS) that processes raw Channel Impulse Response (CIR) sequences from UWB sensors. It uses two parallel conductance-based Liquid Time-Constant (LTC) neural circuits with cross-circuit communication.
 
-**Input**: Raw CIR window of 60 timesteps x 1 feature (normalised amplitude)
+**Input**: Raw CIR window of 60 timesteps x 1 feature (normalised amplitude) + FP_AMPL1/2/3 (first-path amplitudes)
 **Output**: P(NLOS) in [0, 1]
-**Total Parameters**: ~17,000
+**Total Parameters**: ~17,200
 **Embedding Dimension**: 64 (used by downstream Stage 2 and Stage 3)
 
 ---
@@ -24,14 +24,35 @@ The DualCircuit_PI_HLNN is a binary classifier (LOS vs NLOS) that processes raw 
                     │   (same CIR fed to both cells)   │
                     └────────────────┬────────────────┘
                                      │
-                  ┌──────────────────┼──────────────────┐
-                  ▼                  │                   ▼
-        ┌─────────────────┐         │         ┌─────────────────┐
-        │   PILiquidCell  │         │         │   PILiquidCell  │
-        │    (cell_los)   │◄────────┼────────►│   (cell_nlos)   │
+        ┌────────────────────────────┤
+        │                            │
+        │   ┌──────────────────┐     │
+        │   │  FP_AMPL1/2/3    │     │
+        │   │  (batch, 3)      │     │
+        │   └────────┬─────────┘     │
+        │            │               │
+        │   ┌────────▼─────────┐     │
+        │   │ fp_to_los_init   │     │
+        │   │ Linear(3→32)     │     │
+        │   │ → 0.1×tanh(·)   │     │
+        │   │ = h_los_0        │     │
+        │   └──────────────────┘     │
+        │            │               │
+        │   ┌────────▼─────────┐     │
+        │   │ fp_to_nlos_init  │     │
+        │   │ Linear(3→32)     │     │
+        │   │ → 0.1×tanh(·)   │     │
+        │   │ = h_nlos_0       │     │
+        │   └──────────────────┘     │
+        │            │               │
+                  ┌──┴───────────────┴──────────────────┐
+                  ▼                                      ▼
+        ┌─────────────────┐                   ┌─────────────────┐
+        │   PILiquidCell  │                   │   PILiquidCell  │
+        │    (cell_los)   │◄─────────────────►│   (cell_nlos)   │
         │   32 neurons    │  Cross-Circuit    │   32 neurons    │
-        │                 │  Gated Projections│                 │
-        └────────┬────────┘         │         └────────┬────────┘
+        │   init: h_los_0 │  Gated Projections│   init: h_nlos_0│
+        └────────┬────────┘                   └────────┬────────┘
                  │          (at every timestep)         │
                  │                                      │
                  ▼                                      ▼
@@ -152,7 +173,18 @@ For each sub-step k = 1..6:
     v = (Cm_t × v + g_leak × v_leak + w_num + I_sensory)
         ─────────────────────────────────────────────────
                     Cm_t + g_leak + w_den + ε
+
+# After all 6 sub-steps: clamp hidden state for numerical stability
+v = clamp(v, -1.0, 1.0)
 ```
+
+### State Clamping
+
+After the ODE solver completes all 6 sub-steps, the hidden state is clamped to [-1, 1]:
+```python
+v = torch.clamp(v, -1.0, 1.0)
+```
+This prevents numerical instability during training — without clamping, the ODE dynamics can occasionally diverge (especially early in training when parameters are random), causing NaN gradients.
 
 ### Emergent Time Constant (Tau)
 
@@ -237,6 +269,52 @@ Timestep t:
 
 ---
 
+## Component 2b: FP_AMPL Conditioning (Initial Hidden State Seeding)
+
+Instead of zero-initialising the hidden state of each circuit, the DW1000's first-path amplitude measurements (FP_AMPL1, FP_AMPL2, FP_AMPL3) seed the initial state:
+
+```
+FP_AMPL1/2/3 (normalised by RXPACC/64)
+        │
+        ▼
+┌──────────────────────────┐     ┌──────────────────────────┐
+│ fp_to_los_init           │     │ fp_to_nlos_init          │
+│ Linear(3 → 32, no bias) │     │ Linear(3 → 32, no bias) │
+│ → tanh(·)               │     │ → tanh(·)               │
+│ → × 0.1                 │     │ → × 0.1                 │
+│ = h_los_0               │     │ = h_nlos_0              │
+└──────────────────────────┘     └──────────────────────────┘
+```
+
+```python
+h_los_0  = 0.1 * tanh(fp_to_los_init(fp_features))    # (batch, 32)
+h_nlos_0 = 0.1 * tanh(fp_to_nlos_init(fp_features))   # (batch, 32)
+```
+
+### Why 0.1 Scaling?
+
+The 0.1 factor is critical — it provides a **gentle nudge** rather than a strong bias:
+- Too large (e.g. 1.0): the model shortcuts from FP amplitudes alone, ignoring CIR temporal dynamics
+- Too small (e.g. 0.0): no hardware prior, circuits start from zero (wastes the FP information)
+- 0.1: gives a hint about channel conditions but forces the model to develop its understanding from the actual CIR waveform
+
+### Physics Connection to Tau
+
+Since `τ = Cm / (g_leak + Σ(w × gate(v)))` and `v_0 = h_los_0` or `h_nlos_0` comes from FP_AMPL, the time constant is immediately influenced by the hardware's first-path measurement from timestep 0:
+- **Strong FP** (likely LOS): starts the circuit in one dynamical regime
+- **Weak FP** (likely NLOS): starts it in another regime
+- Tau then evolves as the CIR waveform is processed timestep by timestep
+
+### FP_AMPL Conditioning Parameters
+
+| Parameter | Shape | Count | Purpose |
+|-----------|-------|-------|---------|
+| fp_to_los_init (W) | [3, 32] | 96 | FP_AMPL → LOS initial state |
+| fp_to_nlos_init (W) | [3, 32] | 96 | FP_AMPL → NLOS initial state |
+| **Total** | | **192** | |
+
+---
+
 ## Component 3: Attention Pooling
 
 After 60 timesteps, each circuit has produced a sequence of hidden states:
@@ -306,13 +384,14 @@ The 64-dim embedding is also used by Stage 2 (bounce classifier) and Stage 3 (ra
 
 | Component | Parameters | % of Total |
 |-----------|-----------|------------|
-| cell_los (PILiquidCell) | 4,288 | 25.3% |
-| cell_nlos (PILiquidCell) | 4,288 | 25.3% |
-| Cross-circuit projections | 2,048 | 12.1% |
-| Cross-circuit gates | 4,160 | 24.5% |
+| cell_los (PILiquidCell) | 4,288 | 24.9% |
+| cell_nlos (PILiquidCell) | 4,288 | 24.9% |
+| FP_AMPL conditioning (2 × Linear(3→32)) | 192 | 1.1% |
+| Cross-circuit projections | 2,048 | 11.9% |
+| Cross-circuit gates | 4,160 | 24.2% |
 | Attention pooling | 66 | 0.4% |
-| Classifier | 2,113 | 12.4% |
-| **Total** | **16,963** | **100%** |
+| Classifier | 2,113 | 12.3% |
+| **Total** | **~17,155** | **100%** |
 
 ---
 
@@ -327,23 +406,30 @@ Step 1: PREPROCESSING (before model)
    → Min-max normalise to [0, 1]
    → Shape: (60, 1)
 
-Step 2: DUAL-CIRCUIT PROCESSING (60 timesteps)
+Step 2: FP_AMPL CONDITIONING (initial state seeding)
+   fp = [FP_AMPL1, FP_AMPL2, FP_AMPL3] / RXPACC / 64   # normalise
+   h_los_0  = 0.1 × tanh(Linear(3→32)(fp))               # gentle nudge for LOS circuit
+   h_nlos_0 = 0.1 × tanh(Linear(3→32)(fp))               # gentle nudge for NLOS circuit
+
+Step 3: DUAL-CIRCUIT PROCESSING (60 timesteps)
+   Initialise: h_los = h_los_0, h_nlos = h_nlos_0
    For t = 0 to 59:
      a. Read CIR amplitude x_t
      b. Cross-circuit projection: project h_nlos → LOS space, h_los → NLOS space
      c. Gating: sigmoid gates decide how much cross-info to accept
      d. Mix: h_los += gate × projected_nlos (and vice versa)
      e. ODE solve: both cells run 6 Euler sub-steps with x_t as sensory input
-     f. Store hidden states and tau values
+     f. Clamp: v = clamp(v, -1.0, 1.0) for numerical stability
+     g. Store hidden states and tau values
 
-Step 3: ATTENTION POOLING
+Step 4: ATTENTION POOLING
    LOS circuit:  60 hidden states → weighted sum → 32-dim
    NLOS circuit: 60 hidden states → weighted sum → 32-dim
 
-Step 4: FUSION
+Step 5: FUSION
    Concatenate: [h_los_pooled | h_nlos_pooled] → 64-dim embedding
 
-Step 5: CLASSIFICATION
+Step 6: CLASSIFICATION
    64-dim → Linear → SiLU → Dropout → Linear → Sigmoid → P(NLOS)
 ```
 
@@ -382,7 +468,8 @@ Step 5: CLASSIFICATION
 | hidden_size | 32 per circuit | Circuit capacity (64 total embedding) |
 | ode_unfolds | 6 | ODE solver sub-steps per timestep |
 | batch_size | 64 | Training batch size |
-| max_epochs | 50 | Fixed training duration (no early stopping) |
+| max_epochs | 40 | Maximum training epochs |
+| patience | 10 | Early stopping patience (restore best model) |
 | learning_rate | 1e-3 | AdamW optimiser |
 | weight_decay | 1e-4 | L2 regularisation |
 | warmup_epochs | 3 | Linear LR warmup |
