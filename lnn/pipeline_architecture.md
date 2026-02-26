@@ -2,13 +2,15 @@
 
 ## Overview
 
-A 3-stage ML pipeline that takes a raw UWB CIR (Channel Impulse Response) waveform and produces a corrected distance measurement. Each stage answers one question:
+A 3-stage ML pipeline that takes a raw UWB CIR (Channel Impulse Response) waveform and produces a corrected distance measurement. Each stage answers one question, and each stage gates the next:
 
-| Stage | Question | Model | Output |
-|-------|----------|-------|--------|
-| **Stage 1** | Is this signal LOS or NLOS? | DualCircuit_PI_HLNN (LNN) | Binary classification + 64-dim embedding |
-| **Stage 2** | If NLOS, is the signal quality good enough to correct? | Random Forest on LNN embeddings | Correctable vs Challenging |
-| **Stage 3** | If correctable, how much error should we subtract? | Random Forest on LNN embeddings | Ranging error (meters) |
+| Stage | Question | Plain English | Model | Output |
+|-------|----------|---------------|-------|--------|
+| **Stage 1** | LOS or NLOS? | "Is there an obstruction?" | DualCircuit_PI_HLNN (LNN) | Binary classification + 64-dim embedding |
+| **Stage 2** | Correctable single-bounce? | "Can we see the bounce path clearly enough to fix it?" | Random Forest on LNN embeddings | Correctable vs Challenging |
+| **Stage 3** | How much error? | "How many meters do we subtract?" | Random Forest on LNN embeddings | Ranging error (meters) |
+
+**Storyline**: Classify LOS/NLOS → if NLOS, assess the single-bounce signal quality → if correctable, predict the distance correction.
 
 **Final correction**: `d_corrected = d_hardware - predicted_error`
 
@@ -16,18 +18,21 @@ A 3-stage ML pipeline that takes a raw UWB CIR (Channel Impulse Response) wavefo
 Raw CIR (1016 samples) + FP_AMPL1/2/3
          |
     [ Stage 1: DualCircuit_PI_HLNN ]
+    "Is there an obstruction?"
          |
     LOS? ──yes──> Use d_hardware as-is (no correction needed)
          |
-        NLOS
+        NLOS (single-bounce by geometry)
          |
     [ Stage 2: RF Classifier on 64-dim LNN embeddings ]
+    "Can we see the bounce path clearly enough to fix it?"
          |
-    Correctable? ──no──> Flag as "Challenging" (unreliable correction)
+    Correctable? ──no──> Flag as "Challenging" (bounce path not isolatable)
          |
-       yes
+       yes (bounce is dominant + CIR is clean)
          |
     [ Stage 3: RF Regressor on 64-dim LNN embeddings ]
+    "How many meters do we subtract?"
          |
     predicted_error (meters)
          |
@@ -163,13 +168,13 @@ The `model.embed(cir_sequence, fp_features)` method returns a **64-dim vector** 
 
 ---
 
-## Stage 2: Signal Quality Classification
+## Stage 2: Single-Bounce Quality Assessment
 
 ### Intent
 
-All 1800 NLOS samples are single-bounce by geometry. But not all are equally easy to correct. Stage 2 asks: **is this NLOS signal clean enough for reliable distance correction?**
+All 1800 NLOS samples are single-bounce by geometry (TX → wall → RX). But not all single-bounce signals look the same in the CIR. Stage 2 asks: **can we clearly identify and isolate the single-bounce path in this CIR?**
 
-Think of it like medical imaging triage: before attempting diagnosis (Stage 3), check if the scan quality is good enough to trust the diagnosis.
+If the bounce path is dominant and the CIR is clean (few peaks), then Stage 3 can reliably predict how much distance error to correct. If the bounce is buried in multipath or the CIR has complex morphology, the correction would be unreliable — so we flag it as "Challenging" and don't attempt correction.
 
 ### The Problem with Simple Labels
 
@@ -216,17 +221,26 @@ This asks: "How many distinct signal paths are visible in the CIR?" Few peaks (1
 
 ### Architecture
 
+Stage 2 still processes the **same raw CIR** — it goes through the same frozen Stage 1 encoder to produce a 64-dim embedding. The difference is what sits on top: a classifier instead of Stage 1's sigmoid head.
+
 ```
-Frozen Stage 1 encoder
+Same raw CIR (1016 samples) + FP_AMPL1/2/3
         |
-   64-dim LNN embedding (for each NLOS sample)
+   [ Same preprocessing: RXPACC norm -> ROI align -> 60-sample crop -> [0,1] ]
         |
+   [ Frozen Stage 1 DualCircuit_PI_HLNN encoder ]
+        |
+   64-dim LNN embedding  <-- this IS a CIR representation
+        |                     (learned temporal dynamics from the CIR waveform)
    Random Forest Classifier (200 trees)
         |
    Correctable (0) or Challenging (1)
 ```
 
-The RF sees only the 64-dim learned embeddings — it does NOT see bounce_dominance or peak_count at inference time. Those were only used to create the training labels. The RF must learn to predict signal quality purely from the LNN's temporal dynamics representation.
+**Key distinction — training labels vs inference input:**
+- **Training labels** come from geometric + morphological analysis (bounce_dominance, peak_count). These are computed directly on the raw CIR using ground truth `bounce_path_idx`.
+- **Inference input** is the 64-dim LNN embedding (a compressed, learned CIR representation). The RF does NOT see bounce_dominance or peak_count at inference time.
+- The RF must learn to predict signal quality purely from the LNN's temporal dynamics representation of the CIR. This works because the embedding captures the same CIR patterns (peak structure, energy distribution) that the labels were derived from, but in a learned feature space.
 
 ### Label Distribution
 
@@ -253,11 +267,13 @@ This is **physically correct** — the pipeline honestly identifies that this sc
 
 ---
 
-## Stage 3: Ranging Error Regression
+## Stage 3: Distance Correction (Ranging Error Prediction)
 
 ### Intent
 
-For the samples that Stage 2 labeled as correctable, Stage 3 predicts **how many meters to subtract** from the hardware distance to get the true distance.
+Stage 2 confirmed the single-bounce path is clearly identifiable. Now Stage 3 answers the final question: **how many meters of error did the bounce path introduce?**
+
+In NLOS, the UWB hardware reports a distance based on the bounce path (TX → wall → RX), which overshoots the true TX → RX distance. Stage 3 predicts this overshoot so we can subtract it:
 
 ```
 d_corrected = d_hardware - predicted_error
@@ -298,10 +314,16 @@ Per group:
 
 ### Architecture
 
+Again, Stage 3 processes the **same raw CIR** through the same frozen encoder. All three stages share the same CIR-to-embedding path — only the downstream head differs.
+
 ```
-Frozen Stage 1 encoder
+Same raw CIR (1016 samples) + FP_AMPL1/2/3
         |
-   64-dim LNN embedding (for each correctable NLOS sample)
+   [ Same preprocessing: RXPACC norm -> ROI align -> 60-sample crop -> [0,1] ]
+        |
+   [ Frozen Stage 1 DualCircuit_PI_HLNN encoder ]
+        |
+   64-dim LNN embedding  <-- same CIR representation as Stage 2
         |
    Random Forest Regressor (200 trees)
         |
@@ -310,7 +332,7 @@ Frozen Stage 1 encoder
    d_corrected = d_hardware - predicted_error
 ```
 
-Same shared encoder, same 64-dim embeddings, but now a **regressor** instead of a classifier. The RF learns a continuous mapping from temporal CIR dynamics to ranging error magnitude.
+Same shared encoder, same CIR-derived 64-dim embeddings, but now a **regressor** instead of a classifier. The RF learns a continuous mapping from the CIR's temporal dynamics (encoded in the embedding) to ranging error magnitude.
 
 ### Results
 
@@ -337,9 +359,9 @@ Distance Correction:
 
 The DualCircuit_PI_HLNN encoder is trained once (Stage 1) and frozen. Its 64-dim embedding captures rich temporal dynamics from the CIR — how the signal rises, peaks, decays, and how multipath components interfere. This single representation serves three different tasks:
 
-1. **LOS vs NLOS** (Stage 1 classifier head) — is there an obstruction?
-2. **Signal quality** (Stage 2 RF) — is the NLOS signal clean enough?
-3. **Error magnitude** (Stage 3 RF) — how much to correct?
+1. **LOS vs NLOS** (Stage 1 classifier head) — "Is there an obstruction?"
+2. **Single-bounce quality** (Stage 2 RF) — "Can we see the bounce path clearly enough?"
+3. **Distance correction** (Stage 3 RF) — "How many meters do we subtract?"
 
 This is efficient: one 17K-parameter encoder replaces three separate feature extractors.
 
@@ -406,21 +428,21 @@ crop = sig[le-10 : le+50]                     # 60-sample window
 crop = (crop - min) / (max - min)             # instance normalize
 fp = [FP_AMPL1, FP_AMPL2, FP_AMPL3] / RXPACC / 64  # normalize FP
 
-# 2. Stage 1: LOS/NLOS
-embedding = encoder.embed(crop, fp_features=fp)  # 64-dim
+# 2. Stage 1: "Is there an obstruction?"
+embedding = encoder.embed(crop, fp_features=fp)  # 64-dim CIR representation
 prob_nlos = encoder.forward(crop, fp_features=fp) # P(NLOS)
 
 if prob_nlos < 0.5:
     return d_hardware  # LOS — no correction needed
 
-# 3. Stage 2: Signal Quality
+# 3. Stage 2: "Can we see the bounce path clearly enough?"
 quality = rf_classifier.predict(embedding)  # 0=Correctable, 1=Challenging
 
 if quality == 1:
-    return d_hardware, flag="low_confidence"  # Challenging — correction unreliable
+    return d_hardware, flag="low_confidence"  # Bounce not isolatable — don't attempt correction
 
-# 4. Stage 3: Ranging Error Correction
-predicted_error = rf_regressor.predict(embedding)  # meters
+# 4. Stage 3: "How many meters do we subtract?"
+predicted_error = rf_regressor.predict(embedding)  # meters of bounce-path overshoot
 d_corrected = d_hardware - predicted_error
 
 return d_corrected  # Corrected distance
