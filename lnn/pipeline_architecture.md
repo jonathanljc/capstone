@@ -47,9 +47,9 @@ Raw CIR (1016 samples) + FP_AMPL1/2/3
 
 **CIR**: 1016 time-domain samples at ~1 ns/sample (~0.3003 m per index). The CIR captures every signal path between TX and RX — direct, reflected, scattered.
 
-**Dataset**: 3600 samples total
-- **1800 LOS** (3 scenarios: 4.55m, 8.41m, 9.76m) x 6 UWB channels
-- **1800 NLOS** (3 scenarios: 12.79m, 16.09m, 16.80m bounce paths) x 6 UWB channels
+**Dataset**: 6000 samples total
+- **3000 LOS** (4 scenarios: 4.55m, 8.41m, 9.76m, 10.19m) x 6 UWB channels
+- **3000 NLOS** (5 scenarios: 8.91m, 9.54m, 12.79m, 16.09m, 16.80m bounce paths) x 6 UWB channels
 - All NLOS is **single-bounce by geometry** — TX emits, signal hits a wall/reflector, bounces to RX. There is no direct path (blocked by obstruction).
 
 **Ground truth distances** (measured):
@@ -61,6 +61,8 @@ Raw CIR (1016 samples) + FP_AMPL1/2/3
 
 | NLOS Scenario | d_direct | d_bounce | Ranging Error | bounce_path_idx |
 |---------------|----------|----------|---------------|-----------------|
+| 8.91m | 6.10m | 8.91m | ~2.81m | — |
+| 9.54m | 7.67m | 9.54m | ~1.87m | — |
 | 12.79m | 8.82m | 12.79m | ~3.97m | ~810 |
 | 16.09m | 7.20m | 16.09m | ~8.89m | ~820 |
 | 16.80m | 13.06m | 16.80m | ~3.74m | ~756 |
@@ -75,7 +77,7 @@ Before correcting anything, we need to know: **is this signal LOS or NLOS?** LOS
 
 ### Architecture — DualCircuit_PI_HLNN
 
-A **Physics-Informed Hybrid Liquid Neural Network** with ~17,200 parameters.
+A **Physics-Informed Hybrid Liquid Neural Network** with ~17,150 parameters.
 
 **Why "Liquid"?** Liquid Neural Networks (Hasani et al. 2020) are based on the Liquid Time-Constant (LTC) neuron model — an ODE-based neuron inspired by biological neural circuits. Unlike standard RNNs where the time constant is implicit, LTC neurons have an **explicit time constant tau** that emerges from the ODE dynamics:
 
@@ -98,7 +100,7 @@ This tau adapts based on the input — it's not a fixed hyperparameter but a **l
                     +--- cross-talk ----+
                     |    (gated)        |
                     |                   |
-              attn pool (32)      attn pool (32)
+              avg pool (32)       avg pool (32)
                     |                   |
                     +-------cat---------+
                             |
@@ -123,11 +125,11 @@ This creates **competitive dynamics** — when one circuit is confident (strong 
 **FP_AMPL conditioning**: The DW1000 reports first-path amplitudes (FP_AMPL1/2/3) — these are hardware-level measurements of the first detected signal path's strength. Instead of zero-initializing the circuits, FP_AMPL seeds the initial hidden state:
 
 ```python
-h_los_0  = 0.1 * tanh(Linear(3 -> 32)(fp_features))   # gentle nudge
-h_nlos_0 = 0.1 * tanh(Linear(3 -> 32)(fp_features))   # from FP_AMPL
+h_los_0  = 0.01 * tanh(Linear(3 -> 32)(fp_features))   # gentle nudge
+h_nlos_0 = 0.01 * tanh(Linear(3 -> 32)(fp_features))   # from FP_AMPL
 ```
 
-The 0.1 scale factor is critical — it gives a hint but forces the model to develop its understanding from the actual CIR temporal dynamics, not just shortcut from FP amplitudes.
+The 0.01 scale factor is critical — it gives a hint but forces the model to develop its understanding from the actual CIR temporal dynamics, not just shortcut from FP amplitudes.
 
 **Why this makes tau physics-informed**: Since tau = Cm / (g_leak + sum(w * gate(v))) and v_0 comes from FP_AMPL, the time constant is immediately influenced by the hardware's first-path measurement. Strong FP (likely LOS) starts the circuit in one regime; weak FP (likely NLOS) starts it in another. The tau then evolves as the CIR waveform is processed timestep by timestep.
 
@@ -141,7 +143,7 @@ Raw CIR (1016 samples)
    (accounts for preamble accumulation count — physics normalization)
     |
     v
-2. ROI alignment: find leading edge in [740, 890] search window
+2. ROI alignment: find leading edge in [740, 810] search window
    (backtrack from peak to noise threshold crossing)
     |
     v
@@ -154,11 +156,11 @@ Raw CIR (1016 samples)
 Input tensor: (batch, 60, 1)
 ```
 
-The ROI window [740, 890] was derived empirically — all CIR peaks across all 36 CSV files fall within indices 743-807. The 60-sample crop captures the leading edge, main peak, and early multipath.
+The ROI window [740, 810] was derived empirically — all CIR peaks across all 36 CSV files fall within indices 743-807. The 60-sample crop captures the leading edge, main peak, and early multipath.
 
 ### Embedding Output
 
-The `model.embed(cir_sequence, fp_features)` method returns a **64-dim vector** (32 from LOS circuit + 32 from NLOS circuit, attention-pooled over all 60 timesteps). This embedding is the shared representation used by Stage 2 and Stage 3.
+The `model.embed(cir_sequence, fp_features)` method returns a **64-dim vector** (32 from LOS circuit + 32 from NLOS circuit, time-averaged over all 60 timesteps). This embedding is the shared representation used by Stage 2 and Stage 3. The readout computes (1/T) Σ h(t) — a standard dynamical-systems observable with zero learnable parameters — ensuring all temporal discrimination originates from the ODE dynamics and time constants τ.
 
 ### Results
 
@@ -221,7 +223,7 @@ This asks: "How many distinct signal paths are visible in the CIR?" Few peaks (1
 
 ### Architecture
 
-Stage 2 still processes the **same raw CIR** — it goes through the same frozen Stage 1 encoder to produce a 64-dim embedding. The difference is what sits on top: a classifier instead of Stage 1's sigmoid head.
+Stage 2 still processes the **same raw CIR** — it goes through the same frozen Stage 1 encoder to produce a 64-dim time-averaged embedding (average pooling over the ODE trajectory, no learnable readout). The difference is what sits on top: a classifier instead of Stage 1's sigmoid head.
 
 ```
 Same raw CIR (1016 samples) + FP_AMPL1/2/3
@@ -248,17 +250,16 @@ Same raw CIR (1016 samples) + FP_AMPL1/2/3
 Correctable (BOTH conditions met):     479 / 1800 (26.6%)
 Challenging (either condition fails):  1321 / 1800 (73.4%)
 
-Per scenario:
-  7.79m (d_bounce=12.79m):   90 correctable / 600 total  (15.0%)
-  10.77m (d_bounce=16.09m): 117 correctable / 600 total  (19.5%)
-  14m (d_bounce=16.80m):      0 correctable / 600 total   (0.0%)
+5 NLOS scenarios (360 samples each = 6 channels × 60 per channel):
+  8.91m, 9.54m, 12.79m, 16.09m, 16.80m
+  (per-scenario breakdown regenerated on each run)
 ```
 
-The 16.80m scenario has **zero** correctable samples because:
-1. Its direct path is the longest (13.06m), creating extensive multipath (median 11 peaks)
-2. Its bounce-vs-direct gap is the smallest (3.74m = ~12 CIR indices), so the bounce peak appears as a minor shoulder on the main peak with only ~8.7% of ROI energy
+Scenarios with large bounce-vs-direct gaps (e.g. 8.91m, 9.54m) tend to have higher correctable rates because the bounce peak is well-separated from multipath. Scenarios with small gaps (e.g. 16.80m: gap = 3.74m = ~12 CIR indices) tend toward zero correctable because:
+1. The direct path is long (13.06m), creating extensive multipath
+2. The bounce peak appears as a minor shoulder on the main peak with little energy concentration
 
-This is **physically correct** — the pipeline honestly identifies that this scenario's signals are too complex for reliable correction, rather than attempting bad corrections.
+This is **physically correct** — the pipeline honestly identifies which signals are too complex for reliable correction, rather than attempting bad corrections.
 
 ### Results
 
@@ -294,23 +295,13 @@ if bounce_dominance < 0.50:
 ranging_error = d_hardware - d_direct   # target (meters)
 ```
 
-After filtering: **479 correctable samples** (from 12.79m and 16.09m scenarios only).
+After filtering: correctable samples only (count depends on dataset; regenerated on each run).
 
 ### Target
 
 Per-sample ranging error = `Distance_hardware - d_direct`
 
 This varies per sample because the DW1000's distance estimate fluctuates based on channel conditions, noise, and multipath. It's not a fixed offset per scenario.
-
-```
-Ranging error stats:
-  Mean: 3.295m, Std: 1.748m
-  Min: 0.116m, Max: 6.044m
-
-Per group:
-  12.79m: 240 samples, mean error ~2.0m
-  16.09m: 239 samples, mean error ~4.6m
-```
 
 ### Architecture
 
@@ -336,19 +327,10 @@ Same shared encoder, same CIR-derived 64-dim embeddings, but now a **regressor**
 
 ### Results
 
+Results regenerated on each run (depend on dataset size and correctable sample count).
+
 ```
-Test MAE:   0.4492m
-Test RMSE:  0.8751m
-Test R^2:   0.6961
-
-Per-group test MAE:
-  12.79m: 0.3315m
-  16.09m: 0.5668m
-
-Distance Correction:
-  Before ML: MAE = 3.30m  (raw hardware error)
-  After ML:  MAE = 0.45m  (corrected error)
-  Improvement: ~7.3x lower error
+(Run stage3_ranging_error.ipynb to populate)
 ```
 
 ---
@@ -407,12 +389,21 @@ FP_AMPL1/2/3 appear at two levels:
 
 | File | Description |
 |------|-------------|
-| `stage1_pi_hlnn_best.pt` | Trained DualCircuit_PI_HLNN weights (shared encoder) |
+| `stage1_pi_hlnn_fp_best.pt` | Trained DualCircuit_PI_HLNN weights (shared encoder) |
 | `stage1_config.pt` | Stage 1 hyperparameters |
 | `stage2_bounce_rf.joblib` | Stage 2 RF classifier (signal quality) |
 | `stage2_config.joblib` | Stage 2 config + label strategy |
 | `stage3_nlos_bias_rf.joblib` | Stage 3 RF regressor (ranging error) |
 | `stage3_config.joblib` | Stage 3 config + filter strategy |
+
+## Notebooks
+
+| Notebook | Purpose |
+|----------|---------|
+| `stage1_pi_hlnn.ipynb` | Train Stage 1 DualCircuit_PI_HLNN (LOS/NLOS classifier + shared encoder) |
+| `stage2_bounce_classifier.ipynb` | Train Stage 2 RF classifier (correctable vs challenging) |
+| `stage3_ranging_error.ipynb` | Train Stage 3 RF regressor (ranging error prediction) |
+| **`pipeline_inference.ipynb`** | **Full inference pipeline — chains all 3 stages end-to-end** |
 
 ---
 
@@ -423,7 +414,7 @@ FP_AMPL1/2/3 appear at two levels:
 
 # 1. Preprocess
 sig = raw_cir / RXPACC                        # physics normalization
-leading_edge = find_leading_edge(sig, [740, 890])
+leading_edge = find_leading_edge(sig, [740, 810])
 crop = sig[le-10 : le+50]                     # 60-sample window
 crop = (crop - min) / (max - min)             # instance normalize
 fp = [FP_AMPL1, FP_AMPL2, FP_AMPL3] / RXPACC / 64  # normalize FP
